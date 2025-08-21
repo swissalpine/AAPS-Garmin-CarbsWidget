@@ -1,0 +1,10 @@
+source/settings.mc
+bin/
+.vscode
+
+# windows scripts
+*.bat
+
+# settings for sideloading
+*.SET 
+/.project
