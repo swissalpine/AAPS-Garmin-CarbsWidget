@@ -1,6 +1,9 @@
 source/settings.mc
+aimi-modes-widget/source/settings.mc
 bin/
+aimi-modes-widget/bin/
 .vscode
+.openapsaimi/
 
 # windows scripts
 *.bat

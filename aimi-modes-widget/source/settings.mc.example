@@ -1,0 +1,8 @@
+// Copy this file to settings.mc and adapt values.
+// settings.mc is gitignored (contains your local key).
+
+// OpenApsAIMI Garmin HTTP server (default port 28891)
+var url = "http://127.0.0.1:28891/mode";
+
+// Must match AAPS → Config Builder → Garmin → Request Key
+var garminKey = "";
