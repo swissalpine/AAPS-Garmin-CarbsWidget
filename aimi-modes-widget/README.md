@@ -2,16 +2,19 @@
 
 Widget Connect IQ pour activer les modes OpenApsAIMI depuis la montre :
 
-| Menu | Keyword HTTP | Durée |
-|------|--------------|-------|
-| BFAST | `bfast` | 60 |
-| LUNCH | `lunch` | 60 |
-| DINNER | `dinner` | 60 |
-| HIGH CARB | `highcarb` | 90 |
-| FCL | `fcl` | 30 |
-| STOP | `stop` | 1 |
+| Menu | Keyword HTTP | Durée (query) | NOTE Careportal |
+|------|--------------|---------------|-----------------|
+| BFAST | `bfast` | 60 | `bfast` |
+| LUNCH | `lunch` | 60 | `lunch` |
+| DINNER | `dinner` | 60 | `dinner` |
+| HIGH CARB | `highcarb` | 90 | `highcarb` |
+| COFFEE | `coffee` | 90 | `coffee` (aussi `cafe` / `café` côté APS) |
+| FCL | `fcl` | 30 | `fcl` (+ temp target 80×30) |
+| SPORT | `sport` | 120 | `sport` |
+| STOP | `stop` | 1 | `stop` |
 
-Envoie : `POST http://127.0.0.1:28891/mode?mode=…&duration=…&key=…`
+Envoie : `POST http://127.0.0.1:28891/mode?mode=…&duration=…&key=…`  
+La durée est dans le **paramètre** HTTP / champ TherapyEvent — **pas** dans le texte de la note.
 
 ## Prérequis AAPS (OpenApsAIMI `dev_OAPSAIMI`)
 
@@ -60,8 +63,9 @@ Le fichier `.prg` / package est généré dans `bin/`.
 
 1. Ouvrir le widget → SELECT → choisir **LUNCH**.
 2. SELECT à nouveau → confirmation → envoi.
-3. Dans AAPS : TherapyEvent NOTE `lunch 60` doit apparaître.
-4. Pour FCL : note `fcl 30` (fenêtre de détection min. 60 min côté `therapy.kt`).
+3. Dans AAPS : TherapyEvent NOTE texte **`lunch`** (sans durée) + durée 60 min sur l’événement.
+4. Pour FCL : note **`fcl`**, durée 30 min, **et** temporary target 80 mg/dL × 30 min.
+5. Pour SPORT : note **`sport`**, durée 120 min.
 
 ### Dépannage
 

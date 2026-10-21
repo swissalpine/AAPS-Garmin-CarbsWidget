@@ -83,7 +83,8 @@ class GarminPlugin @Inject constructor(
 
         /** Keywords accepted from Garmin /mode (must match therapy.kt detection). */
         private val ALLOWED_THERAPY_MODES = setOf(
-            "bfast", "lunch", "dinner", "highcarb", "fcl", "stop", "meal", "snack"
+            "bfast", "lunch", "dinner", "highcarb", "coffee", "cafe", "fcl", "sport",
+            "stop", "meal", "snack"
         )
 
         private val DEFAULT_MODE_DURATIONS_MIN = mapOf(
@@ -91,11 +92,19 @@ class GarminPlugin @Inject constructor(
             "lunch" to 60,
             "dinner" to 60,
             "highcarb" to 90,
+            // CoffeeRiseMode.DEFAULT_WINDOW_MIN
+            "coffee" to 90,
+            "cafe" to 90,
             "fcl" to 30,
+            "sport" to 120,
             "meal" to 60,
             "snack" to 30,
             "stop" to 1,
         )
+
+        /** FCL companion temporary target (mg/dL) — ends FCL meal basal with the TT. */
+        private const val FCL_TEMP_TARGET_MGDL = 80.0
+        private const val FCL_TEMP_TARGET_DURATION_MIN = 30
     }
 
     @VisibleForTesting
@@ -743,7 +752,9 @@ class GarminPlugin @Inject constructor(
     }
 
     /**
-     * Activates an AIMI mode from the watch (NOTE keyword detected by therapy.kt).
+     * Activates an AIMI mode from the watch.
+     * NOTE text = keyword only; duration query sets TherapyEvent.duration.
+     * FCL also starts a temporary target 80 mg/dL for 30 minutes.
      * Query: /mode?mode=lunch&duration=60&key=...
      */
     @VisibleForTesting
@@ -756,6 +767,9 @@ class GarminPlugin @Inject constructor(
         val defaultDuration = DEFAULT_MODE_DURATIONS_MIN[rawMode] ?: 60
         val duration = getQueryParameter(uri, "duration", defaultDuration).coerceIn(0, 480)
         loopHub.postTherapyMode(rawMode, duration)
+        if (rawMode == "fcl") {
+            loopHub.postTempTarget(FCL_TEMP_TARGET_MGDL, FCL_TEMP_TARGET_DURATION_MIN)
+        }
         return """{"ok":true,"mode":"$rawMode","duration":$duration}"""
     }
     // end mod
@@ -808,9 +822,12 @@ class GarminPlugin @Inject constructor(
             jo.addProperty("date", glucose.timestamp)
             jo.addProperty("sgv", glucose.value.roundToInt())
             if (i + 1 < glucoseValues.size) {
-                // Compute the 5 minute delta.
+                // 5-minute normalized delta (mg/dL). Round to nearest int so ±1 survives
+                // JSON + watch `.toNumber()` / `format("%.0f")` without collapsing to 0.
                 val delta = 300_000.0 * glucoseSlopeMgDlPerMilli(glucoseValues[i + 1], glucose)
-                jo.addProperty("delta", BigDecimal(delta, MathContext(3, RoundingMode.HALF_UP)))
+                if (delta.isFinite()) {
+                    jo.addProperty("delta", delta.roundToInt())
+                }
             }
             jo.addProperty("direction", glucose.trendArrow.text)
             glucose.noise?.let { n -> jo.addProperty("noise", n) }
@@ -836,10 +853,33 @@ class GarminPlugin @Inject constructor(
                     }
                 }
                 jo.addProperty("cob", loopHub.carbsOnboard)
+                // Pilot / TIR ring: % of returned SGVs in profile target range
+                val low = loopHub.lowGlucoseMark.takeIf { it > 0.0 } ?: 70.0
+                val high = loopHub.highGlucoseMark.takeIf { it > 0.0 } ?: 180.0
+                jo.addProperty("tir", calcTirPercent(glucoseValues, low, high))
+                // Blueprint / Cockpit / Atelier: target (mg/dL), AIMI mode, TBR remaining mins
+                loopHub.currentTargetMgdl?.takeIf { it.isFinite() && it > 0.0 }?.let {
+                    jo.addProperty("target", it.roundToInt())
+                }
+                loopHub.activeTherapyMode?.takeIf { it.isNotBlank() }?.let {
+                    jo.addProperty("mode", it)
+                }
+                loopHub.temporaryBasalRemainingMinutes?.takeIf { it > 0 }?.let {
+                    jo.addProperty("tbrMins", it)
+                }
             }
             joa.add(jo)
         }
         return joa.toString()
+    }
+
+    /** % of glucose samples in [low, high] (mg/dL), for Garmin Pilot outer ring. */
+    private fun calcTirPercent(values: List<GV>, low: Double, high: Double): Int {
+        if (values.isEmpty()) return 0
+        val lo = minOf(low, high)
+        val hi = maxOf(low, high)
+        val inRange = values.count { it.value in lo..hi }
+        return ((inRange * 100.0) / values.size).roundToInt().coerceIn(0, 100)
     }
 
     override fun getPreferenceScreenContent() = PreferenceSubScreenDef(

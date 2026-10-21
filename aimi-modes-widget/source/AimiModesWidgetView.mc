@@ -87,7 +87,9 @@ class AimiModesBehaviorDelegate extends Ui.BehaviorDelegate {
         menu.addItem("LUNCH  60 min", :lunch);
         menu.addItem("DINNER 60 min", :dinner);
         menu.addItem("HIGH CARB 90 min", :highcarb);
+        menu.addItem("COFFEE 90 min", :coffee);
         menu.addItem("FCL  30 min", :fcl);
+        menu.addItem("SPORT 120 min", :sport);
         menu.addItem("STOP", :stop);
         Ui.pushView(menu, new AimiModesMenuDelegate(), Ui.SLIDE_IMMEDIATE);
     }
@@ -95,7 +97,7 @@ class AimiModesBehaviorDelegate extends Ui.BehaviorDelegate {
     function sendModeToAaps() as Void {
         ringColor = Gfx.COLOR_WHITE;
         abfrage = 3;
-        // Query params (not Nightscout JSON) — matches GarminPlugin.onPostMode
+        // duration is query-only; AAPS stores it on TherapyEvent.duration, not in the NOTE text
         Comm.makeWebRequest(
             url,
             {
@@ -152,10 +154,19 @@ class AimiModesMenuDelegate extends Ui.BehaviorDelegate {
             modeKeyword = "highcarb";
             modeLabel = "HIGH CARB";
             modeDuration = 90;
+        } else if (item == :coffee) {
+            // CoffeeRiseMode: default window 90 min (max 150) — cortisol/caffeine rise, not a meal
+            modeKeyword = "coffee";
+            modeLabel = "COFFEE";
+            modeDuration = 90;
         } else if (item == :fcl) {
             modeKeyword = "fcl";
             modeLabel = "FCL";
             modeDuration = 30;
+        } else if (item == :sport) {
+            modeKeyword = "sport";
+            modeLabel = "SPORT";
+            modeDuration = 120;
         } else if (item == :stop) {
             modeKeyword = "stop";
             modeLabel = "STOP";
@@ -205,7 +216,9 @@ class AimiModesWidgetView extends Ui.View {
             menu.addItem("LUNCH  60 min", :lunch);
             menu.addItem("DINNER 60 min", :dinner);
             menu.addItem("HIGH CARB 90 min", :highcarb);
+            menu.addItem("COFFEE 90 min", :coffee);
             menu.addItem("FCL  30 min", :fcl);
+            menu.addItem("SPORT 120 min", :sport);
             menu.addItem("STOP", :stop);
             Ui.pushView(menu, new AimiModesMenuDelegate(), Ui.SLIDE_IMMEDIATE);
         }

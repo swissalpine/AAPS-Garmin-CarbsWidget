@@ -73,8 +73,9 @@ class GarminPluginTest : TestBaseWithProfile() {
         verify(loopHub, atMost(3)).insulinBasalOnboard
         verify(loopHub, atMost(3)).temporaryBasal
         verify(loopHub, atMost(3)).carbsOnboard
-        verify(loopHub, atMost(3)).lowGlucoseMark
-        verify(loopHub, atMost(3)).highGlucoseMark
+        verify(loopHub, atMost(6)).lowGlucoseMark
+        verify(loopHub, atMost(6)).highGlucoseMark
+        verify(loopHub, atMost(6)).currentProfile
         verify(loopHub, atMost(1)).storeHeartRate(
             any(),
             any(),
@@ -479,6 +480,7 @@ class GarminPluginTest : TestBaseWithProfile() {
         val uri = createUri(mapOf("mode" to "lunch", "duration" to "60"))
         assertEquals("""{"ok":true,"mode":"lunch","duration":60}""", gp.onPostMode(uri))
         verify(loopHub).postTherapyMode("lunch", 60)
+        verify(loopHub, times(0)).postTempTarget(any(), any())
     }
 
     @Test
@@ -486,6 +488,24 @@ class GarminPluginTest : TestBaseWithProfile() {
         val uri = createUri(mapOf("mode" to "FCL"))
         assertEquals("""{"ok":true,"mode":"fcl","duration":30}""", gp.onPostMode(uri))
         verify(loopHub).postTherapyMode("fcl", 30)
+        verify(loopHub).postTempTarget(80.0, 30)
+    }
+
+    @Test
+    fun testOnPostMode_Sport() {
+        val uri = createUri(mapOf("mode" to "sport", "duration" to "120"))
+        assertEquals("""{"ok":true,"mode":"sport","duration":120}""", gp.onPostMode(uri))
+        verify(loopHub).postTherapyMode("sport", 120)
+        verify(loopHub, times(0)).postTempTarget(any(), any())
+    }
+
+    /** "coffee": the loop meets the rise with a bounded basal, not with SMBs (CoffeeRiseMode). No temp target. */
+    @Test
+    fun testOnPostMode_CoffeeDefaultDuration() {
+        val uri = createUri(mapOf("mode" to "Coffee"))
+        assertEquals("""{"ok":true,"mode":"coffee","duration":90}""", gp.onPostMode(uri))
+        verify(loopHub).postTherapyMode("coffee", 90)
+        verify(loopHub, times(0)).postTempTarget(any(), any())
     }
 
     @Test
@@ -535,6 +555,8 @@ class GarminPluginTest : TestBaseWithProfile() {
         whenever(loopHub.insulinBasalOnboard).thenReturn(2.5)
         whenever(loopHub.temporaryBasal).thenReturn(0.8)
         whenever(loopHub.carbsOnboard).thenReturn(10.7)
+        whenever(loopHub.lowGlucoseMark).thenReturn(70.0)
+        whenever(loopHub.highGlucoseMark).thenReturn(180.0)
         whenever(loopHub.getGlucoseValues(any(), eq(false))).thenReturn(
             listOf(
                 createGlucoseValue(
@@ -543,7 +565,7 @@ class GarminPluginTest : TestBaseWithProfile() {
             )
         )
         assertEquals(
-            """[{"_id":"-900000","device":"RANDOM","deviceString":"1969-12-31T23:58:30Z","sysTime":"1969-12-31T23:58:30Z","unfiltered":90.0,"date":-90000,"sgv":99,"direction":"Flat","noise":4.5,"units_hint":"mmol","iob":5.2,"tbr":80,"cob":10.7}]""",
+            """[{"_id":"-900000","device":"RANDOM","deviceString":"1969-12-31T23:58:30Z","sysTime":"1969-12-31T23:58:30Z","unfiltered":90.0,"date":-90000,"sgv":99,"direction":"Flat","noise":4.5,"units_hint":"mmol","iob":5.2,"tbr":"0.0/80","cob":10.7,"tir":100}]""",
             gp.onSgv(createUri(mapOf()))
         )
         verify(loopHub).getGlucoseValues(clock.instant().minusSeconds(25L * 300L), false)
@@ -557,6 +579,8 @@ class GarminPluginTest : TestBaseWithProfile() {
         whenever(loopHub.insulinBasalOnboard).thenReturn(2.5)
         whenever(loopHub.temporaryBasal).thenReturn(0.8)
         whenever(loopHub.carbsOnboard).thenReturn(10.7)
+        whenever(loopHub.lowGlucoseMark).thenReturn(70.0)
+        whenever(loopHub.highGlucoseMark).thenReturn(180.0)
         whenever(loopHub.getGlucoseValues(any(), eq(false))).thenAnswer { i ->
             val from = i.getArgument<Instant>(0)
             fromClosedRange(from.toEpochMilli(), clock.instant().toEpochMilli(), 300_000L)
@@ -564,7 +588,7 @@ class GarminPluginTest : TestBaseWithProfile() {
                 .mapIndexed { idx, ts -> createGlucoseValue(ts, 100.0 + (10 * idx)) }.reversed()
         }
         assertEquals(
-            """[{"_id":"100000","device":"RANDOM","deviceString":"1970-01-01T00:00:10Z","sysTime":"1970-01-01T00:00:10Z","unfiltered":90.0,"date":10000,"sgv":120,"delta":10,"direction":"Flat","noise":4.5,"units_hint":"mmol","iob":5.2,"tbr":80,"cob":10.7}]""",
+            """[{"_id":"100000","device":"RANDOM","deviceString":"1970-01-01T00:00:10Z","sysTime":"1970-01-01T00:00:10Z","unfiltered":90.0,"date":10000,"sgv":120,"delta":10,"direction":"Flat","noise":4.5,"units_hint":"mmol","iob":5.2,"tbr":"0.0/80","cob":10.7,"tir":100}]""",
             gp.onSgv(createUri(mapOf("count" to "1")))
         )
         verify(loopHub).getGlucoseValues(
@@ -573,7 +597,7 @@ class GarminPluginTest : TestBaseWithProfile() {
 
 
         assertEquals(
-            """[{"_id":"100000","device":"RANDOM","deviceString":"1970-01-01T00:00:10Z","sysTime":"1970-01-01T00:00:10Z","unfiltered":90.0,"date":10000,"sgv":130,"delta":10,"direction":"Flat","noise":4.5,"units_hint":"mmol","iob":5.2,"tbr":80,"cob":10.7},""" +
+            """[{"_id":"100000","device":"RANDOM","deviceString":"1970-01-01T00:00:10Z","sysTime":"1970-01-01T00:00:10Z","unfiltered":90.0,"date":10000,"sgv":130,"delta":10,"direction":"Flat","noise":4.5,"units_hint":"mmol","iob":5.2,"tbr":"0.0/80","cob":10.7,"tir":100},""" +
                 """{"_id":"-2900000","device":"RANDOM","deviceString":"1969-12-31T23:55:10Z","sysTime":"1969-12-31T23:55:10Z","unfiltered":90.0,"date":-290000,"sgv":120,"delta":10,"direction":"Flat","noise":4.5}]""",
             gp.onSgv(createUri(mapOf("count" to "2")))
         )
@@ -582,7 +606,7 @@ class GarminPluginTest : TestBaseWithProfile() {
         )
 
         assertEquals(
-            """[{"date":10000,"sgv":130,"delta":10,"direction":"Flat","noise":4.5,"units_hint":"mmol","iob":5.2,"tbr":80,"cob":10.7},""" +
+            """[{"date":10000,"sgv":130,"delta":10,"direction":"Flat","noise":4.5,"units_hint":"mmol","iob":5.2,"tbr":"0.0/80","cob":10.7,"tir":100},""" +
                 """{"date":-290000,"sgv":120,"delta":10,"direction":"Flat","noise":4.5}]""",
             gp.onSgv(createUri(mapOf("count" to "2", "brief_mode" to "true")))
         )
@@ -591,6 +615,31 @@ class GarminPluginTest : TestBaseWithProfile() {
         )
 
         verify(loopHub, atLeastOnce()).glucoseUnit
+    }
+
+    @Test
+    fun onSgv_IncludesTargetModeTbrMins() {
+        whenever(loopHub.glucoseUnit).thenReturn(GlucoseUnit.MGDL)
+        whenever(loopHub.insulinOnboard).thenReturn(1.0)
+        whenever(loopHub.insulinBasalOnboard).thenReturn(0.5)
+        whenever(loopHub.temporaryBasal).thenReturn(1.2)
+        whenever(loopHub.carbsOnboard).thenReturn(5.0)
+        whenever(loopHub.lowGlucoseMark).thenReturn(70.0)
+        whenever(loopHub.highGlucoseMark).thenReturn(180.0)
+        whenever(loopHub.currentTargetMgdl).thenReturn(100.0)
+        whenever(loopHub.activeTherapyMode).thenReturn("FCL")
+        whenever(loopHub.temporaryBasalRemainingMinutes).thenReturn(27)
+        whenever(loopHub.currentProfile).thenReturn(null)
+        whenever(loopHub.getGlucoseValues(any(), eq(false))).thenReturn(
+            listOf(createGlucoseValue(clock.instant(), 110.0))
+        )
+        val json = gp.onSgv(createUri(mapOf("count" to "1", "brief_mode" to "true")))
+        org.junit.jupiter.api.Assertions.assertTrue(
+            json.contains("\"target\":100") &&
+                json.contains("\"mode\":\"FCL\"") &&
+                json.contains("\"tbrMins\":27"),
+            "missing target/mode/tbrMins in: $json"
+        )
     }
 
 }
