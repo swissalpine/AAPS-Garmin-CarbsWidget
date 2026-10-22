@@ -2,6 +2,7 @@ package app.aaps.plugins.sync.garmin
 
 import androidx.annotation.VisibleForTesting
 import app.aaps.core.data.iob.InMemoryGlucoseValue
+import app.aaps.core.data.model.BS
 import app.aaps.core.data.model.GV
 import app.aaps.core.data.model.GlucoseUnit
 import app.aaps.core.data.model.HR
@@ -147,6 +148,48 @@ class LoopHubImpl @Inject constructor(
             detectActiveTherapyMode(notes, now)
         }
 
+    /**
+     * Sample TBR (incl. converted EB) every 5 minutes over [windowMs], collapse unchanged percent.
+     * ⚠️ ASYNC IMPACT: runBlocking on processedTbrEbData + profile.
+     */
+    override fun temporaryBasalHistory(windowMs: Long): List<BasalHistoryStep> = runBlocking {
+        val now = clock.millis()
+        val from = now - windowMs.coerceAtLeast(TimeUnit.MINUTES.toMillis(5))
+        val profile = currentProfile
+        val stepMs = TimeUnit.MINUTES.toMillis(5)
+        val out = ArrayList<BasalHistoryStep>()
+        var t = from
+        var lastPct = Int.MIN_VALUE
+        while (t <= now) {
+            val pct = if (profile == null) {
+                100
+            } else {
+                val tb = processedTbrEbData.getTempBasalIncludingConvertedExtended(t)
+                tb?.convertedToPercent(t, profile) ?: 100
+            }
+            if (pct != lastPct) {
+                out.add(BasalHistoryStep(t = t, p = pct.coerceIn(0, 500)))
+                lastPct = pct
+            }
+            t += stepMs
+        }
+        if (out.isEmpty()) out.add(BasalHistoryStep(t = from, p = 100))
+        out
+    }
+
+    /**
+     * SMB bolus timestamps in [windowMs].
+     * ⚠️ ASYNC IMPACT: runBlocking on persistenceLayer.getBolusesFromTime.
+     */
+    override fun smbHistoryTimestamps(windowMs: Long): List<Long> = runBlocking {
+        val from = clock.millis() - windowMs.coerceAtLeast(0L)
+        persistenceLayer.getBolusesFromTime(from, ascending = true)
+            .asSequence()
+            .filter { it.isValid && it.type == BS.Type.SMB }
+            .map { it.timestamp }
+            .toList()
+    }
+
     override val lowGlucoseMark
         get() = profileUtil.convertToMgdl(
             preferences.get(UnitDoubleKey.OverviewLowMark), glucoseUnit
@@ -162,7 +205,9 @@ class LoopHubImpl @Inject constructor(
      * creating a sync→aps dependency. First match in priority order wins.
      */
     @VisibleForTesting
-    internal fun detectActiveTherapyMode(events: List<TE>, now: Long): String? {
+    internal fun detectActiveTherapyMode(allEvents: List<TE>, now: Long): String? {
+        // Context intents ("AIMI_CONTEXT:<id>:{json}") are not modes the person set, see Therapy.
+        val events = allEvents.filterNot { it.isAimiContextNote() }
         fun active(keyword: String, minWindowMs: Long = 0L): Boolean =
             events.any { event ->
                 val note = event.note ?: return@any false
@@ -202,7 +247,6 @@ class LoopHubImpl @Inject constructor(
         return when {
             active("sport") -> "SPORT"
             active("fcl", FCL_MIN_WINDOW_MS) -> "FCL"
-            activeCoffee() -> "COFFEE"
             active("dinner") -> "DINNER"
             active("lunch") -> "LUNCH"
             activeBfast() -> "BFAST"
@@ -211,6 +255,9 @@ class LoopHubImpl @Inject constructor(
             active("fasting") -> "FASTING"
             active("lowcarb") -> "LOWCARB"
             active("anticip") -> "ANTICIP"
+            // After every meal mode: in the loop a declared meal switches the coffee mode off
+            // (CoffeeRiseMode), so the watch must show the meal, not COFFEE.
+            activeCoffee() -> "COFFEE"
             else -> null
         }
     }
