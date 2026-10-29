@@ -6,8 +6,8 @@ import app.aaps.core.data.model.BS
 import app.aaps.core.data.model.GV
 import app.aaps.core.data.model.GlucoseUnit
 import app.aaps.core.data.model.HR
-import app.aaps.core.data.model.SC
 import app.aaps.core.data.model.RM
+import app.aaps.core.data.model.SC
 import app.aaps.core.data.model.TE
 import app.aaps.core.data.model.TT
 import app.aaps.core.data.time.T
@@ -15,7 +15,8 @@ import app.aaps.core.data.ue.Action
 import app.aaps.core.data.ue.Sources
 import app.aaps.core.data.ue.ValueWithUnit
 import app.aaps.core.interfaces.aps.Loop
-import app.aaps.core.interfaces.bolus.WizardBolusExecutor
+import app.aaps.core.interfaces.concurrent.withLock
+import app.aaps.core.interfaces.bolus.MasterActionExecutor
 import app.aaps.core.interfaces.constraints.ConstraintsChecker
 import app.aaps.core.interfaces.db.PersistenceLayer
 import app.aaps.core.interfaces.db.ProcessedTbrEbData
@@ -27,28 +28,32 @@ import app.aaps.core.interfaces.logging.UserEntryLogger
 import app.aaps.core.interfaces.profile.Profile
 import app.aaps.core.interfaces.profile.ProfileFunction
 import app.aaps.core.interfaces.profile.ProfileUtil
-import app.aaps.core.interfaces.pump.DetailedBolusInfo
 import app.aaps.core.interfaces.queue.CommandQueue
-import app.aaps.core.interfaces.utils.DateUtil
 import app.aaps.core.keys.StringKey
 import app.aaps.core.keys.UnitDoubleKey
 import app.aaps.core.keys.interfaces.Preferences
+import app.aaps.core.objects.constraints.ConstraintObject
 import app.aaps.core.objects.extensions.convertedToPercent
+import dev.zacsweers.metro.AppScope
+import dev.zacsweers.metro.ContributesBinding
+import dev.zacsweers.metro.Inject
+import dev.zacsweers.metro.SingleIn
+import io.reactivex.rxjava3.disposables.CompositeDisposable
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.time.Clock
 import java.time.Instant
-import java.util.concurrent.TimeUnit
-import javax.inject.Inject
-import javax.inject.Singleton
 import kotlin.math.abs
 
 /**
  * Interface to the functionality of the looping algorithm and storage systems.
  */
-@Singleton
-class LoopHubImpl @Inject constructor(
+@ContributesBinding(AppScope::class)
+@SingleIn(AppScope::class)
+@Inject
+class LoopHubImpl(
     private val aapsLogger: AAPSLogger,
     private val commandQueue: CommandQueue,
     private val constraintChecker: ConstraintsChecker,
@@ -57,20 +62,20 @@ class LoopHubImpl @Inject constructor(
     private val profileFunction: ProfileFunction,
     private val profileUtil: ProfileUtil,
     private val persistenceLayer: PersistenceLayer,
-    private val userEntryLogger: UserEntryLogger,
     private val preferences: Preferences,
     private val processedTbrEbData: ProcessedTbrEbData,
-    private val dateUtil: DateUtil,
-    private val wizardBolusExecutor: WizardBolusExecutor,
+    private val masterActionExecutor: MasterActionExecutor,
+    private val userEntryLogger: UserEntryLogger,
     @ApplicationScope private val appScope: CoroutineScope
 ) : LoopHub {
+
+    val disposable = CompositeDisposable()
 
     @VisibleForTesting
     var clock: Clock = Clock.systemUTC()
 
-    // Same half-bucket threshold AutosensDataStoreObject.isAbout5minData() uses to decide whether
-    // readings are "about" 5 minutes apart. Used below because the smoothing/calibration overlay's
-    // timestamps do not always match a raw reading's own timestamp exactly (see getGlucoseValues doc).
+    // The same half bucket that AutosensDataStoreObject.isAbout5minData() uses to decide that readings
+    // are "about" 5 minutes apart. See getGlucoseValues for why an exact time match cannot be used.
     private val overlayToleranceMs = T.mins(2).plus(T.secs(30)).msecs()
 
     /** Returns the active insulin profile. */
@@ -125,8 +130,8 @@ class LoopHubImpl @Inject constructor(
 
     override val currentTargetMgdl: Double?
         get() = runBlocking {
-            // Prefer AIMI/APS last-run targetBg (DetermineBasalAIMI2 → rT.targetBG),
-            // same source Overview uses via ProfileExtension — not the static profile midpoint.
+            // Prefer the targetBG of the last APS run (AIMI writes it in rT.targetBG), the same
+            // value the overview shows. Not the static profile middle.
             val apsTarget = loop.lastRun?.constraintsProcessed?.targetBG
             if (apsTarget != null && apsTarget.isFinite() && apsTarget > 0.0) {
                 return@runBlocking apsTarget
@@ -145,11 +150,12 @@ class LoopHubImpl @Inject constructor(
             // Look back far enough for long modes (sport / highcarb up to several hours).
             val from = now - TimeUnit.HOURS.toMillis(12)
             val notes = persistenceLayer.getTherapyEventDataFromTime(from, TE.Type.NOTE, ascending = false)
-            detectActiveTherapyMode(notes, now)
+            GarminActiveTherapyMode.detect(notes, now)
         }
 
     /**
-     * Sample TBR (incl. converted EB) every 5 minutes over [windowMs], collapse unchanged percent.
+     * Reads the TBR (also a converted extended bolus) every 5 minutes over [windowMs] and keeps a
+     * step only when the percent changes.
      * ⚠️ ASYNC IMPACT: runBlocking on processedTbrEbData + profile.
      */
     override fun temporaryBasalHistory(windowMs: Long): List<BasalHistoryStep> = runBlocking {
@@ -178,15 +184,15 @@ class LoopHubImpl @Inject constructor(
     }
 
     /**
-     * SMB bolus timestamps in [windowMs].
+     * Valid SMBs in [windowMs] with timestamp + amount (U).
      * ⚠️ ASYNC IMPACT: runBlocking on persistenceLayer.getBolusesFromTime.
      */
-    override fun smbHistoryTimestamps(windowMs: Long): List<Long> = runBlocking {
+    override fun smbHistory(windowMs: Long): List<SmbHistoryStep> = runBlocking {
         val from = clock.millis() - windowMs.coerceAtLeast(0L)
         persistenceLayer.getBolusesFromTime(from, ascending = true)
             .asSequence()
             .filter { it.isValid && it.type == BS.Type.SMB }
-            .map { it.timestamp }
+            .map { SmbHistoryStep(t = it.timestamp, u = it.amount) }
             .toList()
     }
 
@@ -199,76 +205,6 @@ class LoopHubImpl @Inject constructor(
         get() = profileUtil.convertToMgdl(
             preferences.get(UnitDoubleKey.OverviewHighMark), glucoseUnit
         )
-
-    /**
-     * Mirrors openAPSAIMI [app.aaps.plugins.aps.openAPSAIMI.Therapy] keyword windows without
-     * creating a sync→aps dependency. First match in priority order wins.
-     */
-    @VisibleForTesting
-    internal fun detectActiveTherapyMode(allEvents: List<TE>, now: Long): String? {
-        // Context intents ("AIMI_CONTEXT:<id>:{json}") are not modes the person set, see Therapy.
-        val events = allEvents.filterNot { it.isAimiContextNote() }
-        fun active(keyword: String, minWindowMs: Long = 0L): Boolean =
-            events.any { event ->
-                val note = event.note ?: return@any false
-                note.contains(keyword, ignoreCase = true) &&
-                    now <= (event.timestamp + maxOf(event.duration, minWindowMs))
-            }
-        // high carb: also accept "high carb" spacing
-        fun activeHighCarb(): Boolean =
-            events.any { event ->
-                val note = event.note ?: return@any false
-                (note.contains("highcarb", ignoreCase = true) ||
-                    note.contains("high carb", ignoreCase = true)) &&
-                    now <= (event.timestamp + event.duration)
-            }
-        fun activeBfast(): Boolean =
-            events.any { event ->
-                val note = event.note ?: return@any false
-                (note.contains("bfast", ignoreCase = true) ||
-                    note.contains("breakfast", ignoreCase = true)) &&
-                    now <= (event.timestamp + event.duration)
-            }
-        fun activeCoffee(): Boolean =
-            events.any { event ->
-                val note = event.note ?: return@any false
-                // Same keywords as CoffeeRiseMode (coffee / cafe / café)
-                val isCoffee = note.contains("coffee", ignoreCase = true) ||
-                    note.contains("cafe", ignoreCase = true) ||
-                    note.contains("café", ignoreCase = true)
-                if (!isCoffee) return@any false
-                // Default 90 min when NOTE has no duration (CoffeeRiseMode.windowMin)
-                val windowMs = when {
-                    event.duration <= 0L -> COFFEE_DEFAULT_WINDOW_MS
-                    else -> minOf(event.duration, COFFEE_MAX_WINDOW_MS)
-                }
-                now <= (event.timestamp + windowMs)
-            }
-        return when {
-            active("sport") -> "SPORT"
-            active("fcl", FCL_MIN_WINDOW_MS) -> "FCL"
-            active("dinner") -> "DINNER"
-            active("lunch") -> "LUNCH"
-            activeBfast() -> "BFAST"
-            activeHighCarb() -> "HIGHCARB"
-            active("meal") -> "MEAL"
-            active("fasting") -> "FASTING"
-            active("lowcarb") -> "LOWCARB"
-            active("anticip") -> "ANTICIP"
-            // After every meal mode: in the loop a declared meal switches the coffee mode off
-            // (CoffeeRiseMode), so the watch must show the meal, not COFFEE.
-            activeCoffee() -> "COFFEE"
-            else -> null
-        }
-    }
-
-    companion object {
-        /** Same floor as Therapy.FCL_MIN_WINDOW_MS — FCL notes often ship with duration 0. */
-        private const val FCL_MIN_WINDOW_MS = 60 * 60_000L
-        /** CoffeeRiseMode.DEFAULT_WINDOW_MIN / MAX_WINDOW_MIN */
-        private const val COFFEE_DEFAULT_WINDOW_MS = 90 * 60_000L
-        private const val COFFEE_MAX_WINDOW_MS = 150 * 60_000L
-    }
 
     /** Tells the loop algorithm that the pump is physically connected. */
     override fun connectPump() {
@@ -298,32 +234,29 @@ class LoopHubImpl @Inject constructor(
     /**
      * Retrieves the glucose values starting at from.
      *
-     * The persisted [GV] rows hold the raw sensor value. Where a nearby entry (within
-     * [overlayToleranceMs], not a filled gap) exists in the recent smoothing/calibration overlay
-     * ([iobCobCalculator]'s [app.aaps.core.interfaces.aps.AutosensDataStore.bucketedData]), that
-     * entry's `recalculated` value (smoothed, falling back to calibrated) is used instead, so the
-     * watch shows the same number as the main app screen.
+     * The stored [GV] rows hold the raw sensor value. When the recent smoothing or calibration data
+     * ([iobCobCalculator]'s `ads.bucketedData`) has an entry within [overlayToleranceMs] that is not a
+     * filled gap, its `recalculated` value (smoothed, else calibrated) is used instead. So the watch
+     * shows the same number as the main screen of the app.
      *
-     * An exact timestamp match cannot be assumed: when a CGM source's readings are not perfectly
-     * 5-minute-aligned, the overlay is rebuilt on a re-gridded timeline
-     * (`AutosensDataStoreObject.createBucketedDataRecalculated`) whose timestamps only
-     * coincidentally match a raw row's own timestamp, so we match to the nearest overlay entry
-     * within tolerance instead of requiring an exact key match. Rows with no overlay entry within
-     * tolerance (older backfill history, or no overlay available at all) keep their raw value.
+     * The time of that entry does not always match the raw row exactly: when a CGM does not send
+     * readings every 5 minutes on the dot, the smoothed data is rebuilt on a 5 minute grid. So the
+     * nearest entry within the tolerance is used, not an exact match. Rows with no entry near them
+     * (older history, or no smoothed data at all) keep their raw value.
      *
-     * For a re-gridded source (readings more frequent than the overlay's 5-minute slots, e.g. a
-     * 1-minute CGM like Libre 3), several consecutive raw rows land in the same overlay slot and
-     * would otherwise all get that slot's identical value. That flattens the glucose delta Garmin
-     * computes from consecutive rows to ~0 between them, with the whole 5-minute change instead
-     * dumped as a spike at the slot boundary. So consecutive rows sharing the same overlay slot are
-     * collapsed to a single row (the one closest to the slot's own timestamp), keeping one row per
-     * distinct value the watch would actually need to see.
+     * With a CGM that sends more often than every 5 minutes (a 1 minute CGM like Libre 3), several raw
+     * rows fall on the same grid entry and would all get the same value. The delta the watch computes
+     * from rows next to each other would then be about 0, with the whole change in one jump at the
+     * next entry. So rows that share one grid entry are reduced to one row: the one nearest to the
+     * time of that entry.
      */
     override fun getGlucoseValues(from: Instant, ascending: Boolean): List<GV> = runBlocking {
         val raw = persistenceLayer.getBgReadingsDataFromTime(from.toEpochMilli(), ascending)
-        val overlay = iobCobCalculator.ads.bucketedData.orEmpty()
-            .filterNot { it.filledGap }
-            .sortedBy { it.timestamp }
+        // Copied under the data lock: the store is rebuilt by another thread while we read it.
+        val ads = iobCobCalculator.ads
+        val overlay = ads.dataLock.withLock {
+            ads.bucketedData.orEmpty().filterNot { it.filledGap }.sortedBy { it.timestamp }
+        }
         val result = mutableListOf<GV>()
         var lastSlot: InMemoryGlucoseValue? = null
         for (gv in raw) {
@@ -358,39 +291,53 @@ class LoopHubImpl @Inject constructor(
             carbohydrates.coerceAtMost(constraintChecker.getMaxCarbsAllowed().value())
         // Instant carbs now ride the shared executor (one audited path); it logs the user entry + delivers.
         appScope.launch {
-            wizardBolusExecutor.deliverCarbs(
+            masterActionExecutor.deliverCarbs(
                 carbs = carbsAfterConstraints,
                 note = null,
                 source = Sources.Garmin,
-                onError = { aapsLogger.error(LTag.GARMIN, "carbs delivery failed: $it") }
+                onError = { aapsLogger.error(LTag.GARMIN, "carbs delivery failed: ${it.comment}") }
             )
         }
     }
 
-    // mod Bolus and temp target
-    /** Triggers a bolus. */
-    override fun postBolus(bolus: Double) {
-        aapsLogger.info(LTag.GARMIN, "trigger a bolus of $bolus U")
-        userEntryLogger.log(
-            action = Action.BOLUS,
-            source = Sources.Garmin,
-            note = null,
-            ValueWithUnit.Insulin(bolus)
-        )
-        val detailedBolusInfo = DetailedBolusInfo().apply {
-            eventType = TE.Type.SNACK_BOLUS
-            insulin = bolus
+    /**
+     * Limits the bolus with the bolus constraints (max bolus) and sends it through the shared executor,
+     * the same path as a fixed-amount bolus from the phone: it logs the user entry and refuses the bolus
+     * when the running mode does not allow one.
+     * ⚠️ ASYNC IMPACT: the delivery runs on [appScope]; the limited amount is returned at once.
+     */
+    override fun postBolus(bolus: Double, onNotDelivered: (String) -> Unit): Double {
+        if (!bolus.isFinite() || bolus <= 0.0) return 0.0
+        val limited = constraintChecker.applyBolusConstraints(ConstraintObject(bolus, aapsLogger)).value()
+        if (limited <= 0.0) {
+            aapsLogger.warn(LTag.GARMIN, "bolus of $bolus U refused by the bolus constraints")
+            return 0.0
         }
+        aapsLogger.info(LTag.GARMIN, "bolus of $bolus U asked, $limited U after the bolus constraints")
         appScope.launch {
-            commandQueue.bolus(detailedBolusInfo)
+            masterActionExecutor.deliverInsulin(
+                insulin = limited,
+                note = null,
+                source = Sources.Garmin,
+                onError = {
+                    aapsLogger.error(LTag.GARMIN, "bolus delivery failed: ${it.comment}")
+                    onNotDelivered(it.comment)
+                }
+            )
         }
+        return limited
     }
 
+    /**
+     * ⚠️ ASYNC IMPACT: inserts or cancels the temporary target on [appScope], same as [postCarbs].
+     * A target of 0 or a duration of 0 cancels. Otherwise the target is stored in mg/dL via
+     * [profileUtil] (same conversion as the reference `postTempTarget`).
+     */
     override fun postTempTarget(target: Double, duration: Int) {
         if (target == 0.0 || duration == 0) {
             appScope.launch {
                 persistenceLayer.cancelCurrentTemporaryTargetIfAny(
-                    timestamp = dateUtil.now(),
+                    timestamp = clock.millis(),
                     action = Action.TT,
                     source = Sources.TTDialog,
                     note = null,
@@ -401,7 +348,7 @@ class LoopHubImpl @Inject constructor(
             appScope.launch {
                 persistenceLayer.insertAndCancelCurrentTemporaryTarget(
                     temporaryTarget = TT(
-                        timestamp = dateUtil.now(),
+                        timestamp = clock.millis(),
                         duration = TimeUnit.MINUTES.toMillis(duration.toLong()),
                         reason = TT.Reason.WEAR,
                         lowTarget = profileUtil.convertToMgdl(target, profileUtil.units),
@@ -410,7 +357,7 @@ class LoopHubImpl @Inject constructor(
                     action = Action.TT,
                     source = Sources.Garmin,
                     note = null,
-                    listValues = listOf(
+                    listValues = listOf<ValueWithUnit?>(
                         ValueWithUnit.TETTReason(TT.Reason.AUTOMATION),
                         ValueWithUnit.Mgdl(target),
                         ValueWithUnit.Minute(duration)
@@ -419,11 +366,10 @@ class LoopHubImpl @Inject constructor(
             }
         }
     }
-    // end mod
 
     /**
-     * ⚠️ ASYNC IMPACT: inserts TherapyEvent on [appScope] (same pattern as postTempTarget).
-     * NOTE text is the keyword only (e.g. "lunch"); duration goes on TE.duration so [Therapy]
+     * ⚠️ ASYNC IMPACT: inserts the therapy NOTE on [appScope], same as [postTempTarget].
+     * NOTE text is the keyword only (e.g. "lunch"); duration goes on TE.duration so AIMI Therapy
      * windows correctly without embedding minutes in the note string.
      */
     override fun postTherapyMode(keyword: String, durationMin: Int) {
@@ -432,10 +378,7 @@ class LoopHubImpl @Inject constructor(
             aapsLogger.warn(LTag.GARMIN, "postTherapyMode ignored: empty keyword")
             return
         }
-        val safeDurationMin = when {
-            normalized == "stop" -> durationMin.coerceAtLeast(1)
-            else -> durationMin.coerceIn(1, 480)
-        }
+        val safeDurationMin = GarminTherapyMode.storedDurationMin(normalized, durationMin)
         val note = normalized
         val durationMs = TimeUnit.MINUTES.toMillis(safeDurationMin.toLong())
         aapsLogger.info(LTag.GARMIN, "postTherapyMode note='$note' durationMin=$safeDurationMin")
@@ -445,7 +388,7 @@ class LoopHubImpl @Inject constructor(
             note = note,
         )
         val te = TE(
-            timestamp = dateUtil.now(),
+            timestamp = clock.millis(),
             type = TE.Type.NOTE,
             glucoseUnit = GlucoseUnit.MGDL,
             note = note,
@@ -505,17 +448,11 @@ class LoopHubImpl @Inject constructor(
         )
         appScope.launch {
             try {
-                val result: PersistenceLayer.TransactionResult<SC> = persistenceLayer.insertOrUpdateStepsCount(sc)
+                val result = persistenceLayer.insertOrUpdateStepsCount(sc)
                 val id = result.inserted.firstOrNull()?.id ?: result.updated.firstOrNull()?.id
-                aapsLogger.info(
-                    LTag.GARMIN,
-                    "✅ Steps stored in DB: ID=$id, 5min=$steps5min, timestamp=${java.util.Date(samplingEnd.toEpochMilli())}"
-                )
+                aapsLogger.info(LTag.GARMIN, "steps stored: id=$id 5min=$steps5min at ${samplingEnd.toEpochMilli()}")
             } catch (error: Exception) {
-                aapsLogger.error(
-                    LTag.GARMIN,
-                    "❌ Failed to store steps: ${error.message}"
-                )
+                aapsLogger.error(LTag.GARMIN, "failed to store steps", error)
             }
         }
     }

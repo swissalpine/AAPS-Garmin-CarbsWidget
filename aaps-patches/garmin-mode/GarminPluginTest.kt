@@ -5,33 +5,39 @@ import app.aaps.core.data.model.GlucoseUnit
 import app.aaps.core.data.model.SourceSensor
 import app.aaps.core.data.model.TrendArrow
 import app.aaps.core.interfaces.db.PersistenceLayer
-import app.aaps.core.interfaces.sharedPreferences.SP
+import app.aaps.core.interfaces.notifications.NotificationId
 import app.aaps.core.keys.BooleanNonKey
 import app.aaps.core.keys.IntNonKey
 import app.aaps.core.keys.StringNonKey
+import app.aaps.plugins.sync.SyncStringsValues
 import app.aaps.plugins.sync.garmin.keys.GarminBooleanKey
 import app.aaps.plugins.sync.garmin.keys.GarminIntKey
+import app.aaps.plugins.sync.garmin.keys.GarminIntNonKey
+import app.aaps.plugins.sync.garmin.keys.GarminLongNonKey
 import app.aaps.plugins.sync.garmin.keys.GarminStringKey
 import app.aaps.shared.tests.TestBaseWithProfile
+import app.aaps.shared.tests.generatedTextResolver
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.anyLong
 import org.mockito.Mock
-import org.mockito.Mockito.`when`
 import org.mockito.kotlin.any
 import org.mockito.kotlin.anyOrNull
+import org.mockito.kotlin.argumentCaptor
 import org.mockito.kotlin.atLeastOnce
 import org.mockito.kotlin.atMost
 import org.mockito.kotlin.eq
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.times
 import org.mockito.kotlin.verify
+import org.mockito.kotlin.verifyNoInteractions
 import org.mockito.kotlin.verifyNoMoreInteractions
 import org.mockito.kotlin.whenever
 import java.net.ConnectException
@@ -52,12 +58,11 @@ class GarminPluginTest : TestBaseWithProfile() {
 
     @Mock private lateinit var loopHub: LoopHub
     @Mock private lateinit var persistenceLayer: PersistenceLayer
-    @Mock private lateinit var sp: SP
     private val clock = Clock.fixed(Instant.ofEpochMilli(10_000), ZoneId.of("UTC"))
 
     @BeforeEach
     fun setup() {
-        gp = GarminPlugin(aapsLogger, rh, preferences, sp, context, loopHub, persistenceLayer)
+        gp = GarminPlugin(aapsLogger, rh, preferences, context, loopHub, persistenceLayer, config, notificationManager)
         gp.clock = clock
         whenever(loopHub.currentProfileName).thenReturn("Default")
         whenever(preferences.get(GarminIntKey.LocalHttpPort)).thenReturn(28890)
@@ -73,28 +78,10 @@ class GarminPluginTest : TestBaseWithProfile() {
         verify(loopHub, atMost(3)).insulinBasalOnboard
         verify(loopHub, atMost(3)).temporaryBasal
         verify(loopHub, atMost(3)).carbsOnboard
+        // onSgv reads the marks again for the time in range, and the profile for the TBR rate.
         verify(loopHub, atMost(6)).lowGlucoseMark
         verify(loopHub, atMost(6)).highGlucoseMark
         verify(loopHub, atMost(6)).currentProfile
-        verify(loopHub, atMost(1)).storeHeartRate(
-            any(),
-            any(),
-            any(),
-            anyOrNull(),
-        )
-        verify(loopHub, atMost(1)).storeStepsCount(
-            any(),
-            any(),
-            any(),
-            any(),
-            any(),
-            any(),
-            any(),
-            any(),
-            anyOrNull(),
-        )
-        verify(loopHub, atMost(1)).postTherapyMode(any(), any())
-        verify(loopHub, atMost(1)).postCarbs(any())
         verifyNoMoreInteractions(loopHub)
     }
 
@@ -126,6 +113,102 @@ class GarminPluginTest : TestBaseWithProfile() {
         "steps180" to 60,
         "device" to "Test_Device",
     )
+
+    private fun verifyStepsStored(steps: Map<String, Any>) {
+        verify(loopHub).storeStepsCount(
+            Instant.ofEpochSecond(steps["stepsStart"] as Long),
+            Instant.ofEpochSecond(steps["stepsEnd"] as Long),
+            steps["steps5"] as Int,
+            steps["steps10"] as Int,
+            steps["steps15"] as Int,
+            steps["steps30"] as Int,
+            steps["steps60"] as Int,
+            steps["steps180"] as Int,
+            steps["device"] as String,
+        )
+    }
+
+    @Test
+    fun testReceiveStepsMap() {
+        val steps = createSteps()
+        gp.receiveSteps(steps, false)
+        verifyStepsStored(steps)
+    }
+
+    @Test
+    fun testReceiveStepsMap_NumbersAsText() {
+        val steps = createSteps().mapValues { (_, v) -> v.toString() }
+        gp.receiveSteps(steps, false)
+        verifyStepsStored(createSteps())
+    }
+
+    @Test
+    fun testReceiveStepsMap_TestIsNotStored() {
+        gp.receiveSteps(createSteps(), true)
+    }
+
+    @Test
+    fun testReceiveStepsMap_AllZeroIsNotStored() {
+        gp.receiveSteps(createSteps().mapValues { (k, v) -> if (v is Int) 0 else v }, false)
+    }
+
+    @Test
+    fun testReceiveStepsUri() {
+        val steps = createSteps()
+        gp.receiveSteps(createUri(steps))
+        verifyStepsStored(steps)
+    }
+
+    @Test
+    fun testReceiveHeartRateUri_AlsoReadsSteps() {
+        val params = createHeartRate(99) + createSteps()
+        gp.receiveHeartRate(createUri(params))
+        verify(loopHub).storeHeartRate(
+            Instant.ofEpochSecond(params["hrStart"] as Long),
+            Instant.ofEpochSecond(params["hrEnd"] as Long),
+            99,
+            params["device"] as String
+        )
+        verifyStepsStored(params)
+    }
+
+    @Test
+    fun testReceiveStepsUri_FirstTotalIsOnlyKept() {
+        whenever(preferences.get(GarminIntNonKey.LastTotalSteps)).thenReturn(-1)
+        gp.receiveSteps(URI("http://foo?steps=165&device=Watch"))
+        verify(preferences).put(GarminIntNonKey.LastTotalSteps, 165)
+        verify(preferences).put(GarminLongNonKey.LastTotalStepsTime, clock.millis())
+    }
+
+    @Test
+    fun testReceiveStepsUri_TotalStoresTheDelta() {
+        whenever(preferences.get(GarminIntNonKey.LastTotalSteps)).thenReturn(1000)
+        gp.receiveSteps(URI("http://foo?steps=1250&device=Watch"))
+        verify(preferences).put(GarminIntNonKey.LastTotalSteps, 1250)
+        val now = clock.instant().epochSecond
+        verify(loopHub).storeStepsCount(Instant.ofEpochSecond(now - 300), Instant.ofEpochSecond(now), 250, 0, 0, 0, 0, 0, "Watch")
+    }
+
+    @Test
+    fun testReceiveStepsUri_LowerTotalIsANewDay() {
+        whenever(preferences.get(GarminIntNonKey.LastTotalSteps)).thenReturn(17506)
+        gp.receiveSteps(URI("http://foo?steps=165&device=Watch"))
+        verify(preferences).put(GarminIntNonKey.LastTotalSteps, 165)
+        val now = clock.instant().epochSecond
+        verify(loopHub).storeStepsCount(Instant.ofEpochSecond(now - 300), Instant.ofEpochSecond(now), 165, 0, 0, 0, 0, 0, "Watch")
+    }
+
+    @Test
+    fun testOnPostTempTarget() {
+        gp.onPostTempTarget(createUri(mapOf("target" to 7.5, "duration" to 45)))
+        verify(loopHub).postTempTarget(7.5, 45)
+    }
+
+    @Test
+    fun testOnPostTempTarget_NoValuesCancels() {
+        gp.onPostTempTarget(createUri(mapOf()))
+        verify(loopHub).postTempTarget(0.0, 0)
+    }
 
     private fun createGlucoseValue(timestamp: Instant, value: Double = 93.0) = GV(
         id = 10 * timestamp.toEpochMilli(),
@@ -165,41 +248,6 @@ class GarminPluginTest : TestBaseWithProfile() {
         params["test"] = true
         val uri = createUri(params)
         gp.receiveHeartRate(uri)
-    }
-
-    @Test
-    fun testReceiveStepsMap() {
-        val steps = createSteps()
-        gp.receiveSteps(steps, false)
-        verify(loopHub).storeStepsCount(
-            Instant.ofEpochSecond(steps["stepsStart"] as Long),
-            Instant.ofEpochSecond(steps["stepsEnd"] as Long),
-            steps["steps5"] as Int,
-            steps["steps10"] as Int,
-            steps["steps15"] as Int,
-            steps["steps30"] as Int,
-            steps["steps60"] as Int,
-            steps["steps180"] as Int,
-            steps["device"] as String,
-        )
-    }
-
-    @Test
-    fun testReceiveStepsUri() {
-        val steps = createSteps()
-        val uri = createUri(steps)
-        gp.receiveSteps(uri)
-        verify(loopHub).storeStepsCount(
-            Instant.ofEpochSecond(steps["stepsStart"] as Long),
-            Instant.ofEpochSecond(steps["stepsEnd"] as Long),
-            steps["steps5"] as Int,
-            steps["steps10"] as Int,
-            steps["steps15"] as Int,
-            steps["steps30"] as Int,
-            steps["steps60"] as Int,
-            steps["steps180"] as Int,
-            steps["device"] as String,
-        )
     }
 
     @Test
@@ -399,41 +447,6 @@ class GarminPluginTest : TestBaseWithProfile() {
     }
 
     @Test
-    fun testOnGetBloodGlucose_WithSteps() {
-        `when`(loopHub.isConnected).thenReturn(true)
-        `when`(loopHub.insulinOnboard).thenReturn(1.23)
-        `when`(loopHub.insulinBasalOnboard).thenReturn(0.0)
-        `when`(loopHub.temporaryBasal).thenReturn(0.0)
-        val from = getGlucoseValuesFrom
-        `when`(loopHub.getGlucoseValues(from, true)).thenReturn(
-            listOf(createGlucoseValue(Instant.ofEpochSecond(1_000)))
-        )
-        val params = createHeartRate(88).toMutableMap().apply { putAll(createSteps()) }
-        val uri = createUri(params)
-        gp.onGetBloodGlucose(uri)
-        verify(loopHub).storeHeartRate(
-            Instant.ofEpochSecond(params["hrStart"] as Long),
-            Instant.ofEpochSecond(params["hrEnd"] as Long),
-            88,
-            params["device"] as String,
-        )
-        verify(loopHub).storeStepsCount(
-            Instant.ofEpochSecond(params["stepsStart"] as Long),
-            Instant.ofEpochSecond(params["stepsEnd"] as Long),
-            params["steps5"] as Int,
-            params["steps10"] as Int,
-            params["steps15"] as Int,
-            params["steps30"] as Int,
-            params["steps60"] as Int,
-            params["steps180"] as Int,
-            params["device"] as String,
-        )
-        verify(loopHub).getGlucoseValues(from, true)
-        verify(loopHub).glucoseUnit
-        verify(loopHub).isConnected
-    }
-
-    @Test
     fun testOnGetBloodGlucose_Wait() {
         whenever(loopHub.isConnected).thenReturn(true)
         whenever(loopHub.insulinOnboard).thenReturn(3.14)
@@ -543,6 +556,140 @@ class GarminPluginTest : TestBaseWithProfile() {
         verify(loopHub).isConnected
     }
 
+    // A client only shows values. Carbs or a pump disconnect stored there would never reach the master, and the watch
+    // cannot show why, so the phone says it.
+    private fun clientPlugin(): GarminPlugin = textPlugin(client = true)
+
+    private fun textPlugin(client: Boolean): GarminPlugin {
+        whenever(config.AAPSCLIENT).thenReturn(client)
+        val text = generatedTextResolver("sync" to SyncStringsValues::textOf)
+        return GarminPlugin(aapsLogger, text, preferences, context, loopHub, persistenceLayer, config, notificationManager)
+    }
+
+    private fun postedNotice(id: NotificationId = NotificationId.GARMIN_NOT_ON_CLIENT): String {
+        val captor = argumentCaptor<String>()
+        verify(notificationManager).post(eq(id), captor.capture(), any(), any<Int>(), anyOrNull(), any(), anyOrNull())
+        return captor.firstValue
+    }
+
+    // A watch bolus: refused on a client and without a request key (any app on the phone can reach the
+    // local server), and always limited by the bolus constraints in LoopHub.postBolus.
+    @Test
+    fun testOnPostBolus_OnClientIsRefused() {
+        whenever(preferences.get(GarminStringKey.RequestKey)).thenReturn("key")
+        assertEquals("{\"ok\":false}", textPlugin(client = true).onPostBolus(createUri(mapOf("bolus" to "1.5"))))
+        assertEquals(
+            "The Garmin watch asked for a bolus of 1.50 U. This phone is a client, so no bolus was given. Give it in AAPS.",
+            postedNotice(NotificationId.GARMIN_BOLUS)
+        )
+    }
+
+    @Test
+    fun testOnPostBolus_WithoutKeyIsRefused() {
+        whenever(preferences.get(GarminStringKey.RequestKey)).thenReturn("")
+        assertEquals("{\"ok\":false}", textPlugin(client = false).onPostBolus(createUri(mapOf("bolus" to "1.5"))))
+        assertEquals(
+            "The Garmin watch asked for a bolus of 1.50 U. No bolus was given: a bolus from the watch needs a request key in the Garmin settings.",
+            postedNotice(NotificationId.GARMIN_BOLUS)
+        )
+    }
+
+    @Test
+    fun testOnPostBolus_WithKeyIsGiven() {
+        whenever(preferences.get(GarminStringKey.RequestKey)).thenReturn("key")
+        whenever(loopHub.postBolus(eq(1.5), any())).thenReturn(1.5)
+        assertEquals("{\"ok\":true,\"bolus\":1.5}", textPlugin(client = false).onPostBolus(createUri(mapOf("bolus" to "1.5"))))
+        verify(loopHub).postBolus(eq(1.5), any())
+        verifyNoInteractions(notificationManager)
+    }
+
+    @Test
+    fun testOnPostBolus_LimitedIsTold() {
+        whenever(preferences.get(GarminStringKey.RequestKey)).thenReturn("key")
+        whenever(loopHub.postBolus(eq(12.0), any())).thenReturn(10.0)
+        assertEquals("{\"ok\":true,\"bolus\":10.0}", textPlugin(client = false).onPostBolus(createUri(mapOf("bolus" to "12"))))
+        verify(loopHub).postBolus(eq(12.0), any())
+        assertEquals(
+            "The Garmin watch asked for a bolus of 12.00 U. It was limited to the maximum bolus: 10.00 U.",
+            postedNotice(NotificationId.GARMIN_BOLUS)
+        )
+    }
+
+    @Test
+    fun testOnPostBolus_RefusedByLimitsIsTold() {
+        whenever(preferences.get(GarminStringKey.RequestKey)).thenReturn("key")
+        whenever(loopHub.postBolus(eq(2.0), any())).thenReturn(0.0)
+        assertEquals("{\"ok\":false}", textPlugin(client = false).onPostBolus(createUri(mapOf("bolus" to "2"))))
+        verify(loopHub).postBolus(eq(2.0), any())
+        assertEquals(
+            "The Garmin watch asked for a bolus of 2.00 U. No bolus was given: the bolus limits do not allow it now.",
+            postedNotice(NotificationId.GARMIN_BOLUS)
+        )
+    }
+
+    @Test
+    fun testOnPostBolus_RepeatWithinAMinuteIsRefused() {
+        whenever(preferences.get(GarminStringKey.RequestKey)).thenReturn("key")
+        whenever(loopHub.postBolus(eq(1.5), any())).thenReturn(1.5)
+        val plugin = textPlugin(client = false)
+        plugin.clock = clock
+        assertEquals("{\"ok\":true,\"bolus\":1.5}", plugin.onPostBolus(createUri(mapOf("bolus" to "1.5"))))
+        assertEquals("{\"ok\":false}", plugin.onPostBolus(createUri(mapOf("bolus" to "1.5"))))
+        verify(loopHub).postBolus(eq(1.5), any())
+        assertEquals(
+            "The Garmin watch asked for a bolus of 1.50 U less than one minute after the last one. No bolus was given, so a repeated request cannot give it twice. Ask again in a minute if you really want it.",
+            postedNotice(NotificationId.GARMIN_BOLUS)
+        )
+        // A minute later the next one is accepted again.
+        plugin.clock = Clock.offset(clock, Duration.ofSeconds(60))
+        assertEquals("{\"ok\":true,\"bolus\":1.5}", plugin.onPostBolus(createUri(mapOf("bolus" to "1.5"))))
+        verify(loopHub, times(2)).postBolus(eq(1.5), any())
+    }
+
+    @Test
+    fun testOnPostBolus_NotDeliveredLaterIsTold() {
+        whenever(preferences.get(GarminStringKey.RequestKey)).thenReturn("key")
+        whenever(loopHub.postBolus(eq(1.5), any())).thenAnswer {
+            it.getArgument<(String) -> Unit>(1)("Loop is suspended")
+            1.5
+        }
+        assertEquals("{\"ok\":true,\"bolus\":1.5}", textPlugin(client = false).onPostBolus(createUri(mapOf("bolus" to "1.5"))))
+        verify(loopHub).postBolus(eq(1.5), any())
+        assertEquals(
+            "The Garmin watch asked for a bolus of 1.50 U. It was not given: Loop is suspended",
+            postedNotice(NotificationId.GARMIN_BOLUS)
+        )
+    }
+
+    @Test
+    fun testOnPostBolus_NoOrBadValueDoesNothing() {
+        whenever(preferences.get(GarminStringKey.RequestKey)).thenReturn("key")
+        val plugin = textPlugin(client = false)
+        assertEquals("{\"ok\":false}", plugin.onPostBolus(createUri(mapOf())))
+        assertEquals("{\"ok\":false}", plugin.onPostBolus(createUri(mapOf("bolus" to "-1"))))
+        assertEquals("{\"ok\":false}", plugin.onPostBolus(createUri(mapOf("bolus" to "abc"))))
+        verifyNoInteractions(notificationManager)
+    }
+
+    @Test
+    fun testOnPostCarbs_OnClient() {
+        val uri = createUri(mapOf("carbs" to "12"))
+        assertEquals("", clientPlugin().onPostCarbs(uri))
+        assertEquals("The Garmin watch sent 12 g of carbs. This phone is a client, so they were not entered. Enter them in AAPS.", postedNotice())
+    }
+
+    @Test
+    fun testOnConnectPump_DisconnectOnClient() {
+        val uri = createUri(mapOf("disconnectMinutes" to "20"))
+        whenever(loopHub.isConnected).thenReturn(true)
+        assertEquals("{\"connected\":true}", clientPlugin().onConnectPump(uri))
+        verify(loopHub).isConnected
+        assertEquals(
+            "The Garmin watch asked to connect or disconnect the pump. This phone is a client, so nothing was changed. Do it in AAPS.",
+            postedNotice()
+        )
+    }
+
     @Test
     fun onSgv_NoGlucose() {
         whenever(loopHub.glucoseUnit).thenReturn(GlucoseUnit.MMOL)
@@ -558,10 +705,8 @@ class GarminPluginTest : TestBaseWithProfile() {
         whenever(loopHub.insulinBasalOnboard).thenReturn(2.5)
         whenever(loopHub.temporaryBasal).thenReturn(0.8)
         whenever(loopHub.carbsOnboard).thenReturn(10.7)
-        whenever(loopHub.lowGlucoseMark).thenReturn(70.0)
-        whenever(loopHub.highGlucoseMark).thenReturn(180.0)
         whenever(loopHub.temporaryBasalHistory(any())).thenReturn(emptyList())
-        whenever(loopHub.smbHistoryTimestamps(any())).thenReturn(emptyList())
+        whenever(loopHub.smbHistory(any())).thenReturn(emptyList())
         whenever(loopHub.getGlucoseValues(any(), eq(false))).thenReturn(
             listOf(
                 createGlucoseValue(
@@ -575,12 +720,11 @@ class GarminPluginTest : TestBaseWithProfile() {
         )
         verify(loopHub).getGlucoseValues(clock.instant().minusSeconds(25L * 300L), false)
         verify(loopHub).glucoseUnit
-        // onSgv also reads the target, the active mode and the TBR minutes left (target/mode/tbrMins fields).
         verify(loopHub, atLeastOnce()).currentTargetMgdl
         verify(loopHub, atLeastOnce()).activeTherapyMode
         verify(loopHub, atLeastOnce()).temporaryBasalRemainingMinutes
         verify(loopHub, atLeastOnce()).temporaryBasalHistory(any())
-        verify(loopHub, atLeastOnce()).smbHistoryTimestamps(any())
+        verify(loopHub, atLeastOnce()).smbHistory(any())
     }
 
     @Test
@@ -590,10 +734,8 @@ class GarminPluginTest : TestBaseWithProfile() {
         whenever(loopHub.insulinBasalOnboard).thenReturn(2.5)
         whenever(loopHub.temporaryBasal).thenReturn(0.8)
         whenever(loopHub.carbsOnboard).thenReturn(10.7)
-        whenever(loopHub.lowGlucoseMark).thenReturn(70.0)
-        whenever(loopHub.highGlucoseMark).thenReturn(180.0)
         whenever(loopHub.temporaryBasalHistory(any())).thenReturn(emptyList())
-        whenever(loopHub.smbHistoryTimestamps(any())).thenReturn(emptyList())
+        whenever(loopHub.smbHistory(any())).thenReturn(emptyList())
         whenever(loopHub.getGlucoseValues(any(), eq(false))).thenAnswer { i ->
             val from = i.getArgument<Instant>(0)
             fromClosedRange(from.toEpochMilli(), clock.instant().toEpochMilli(), 300_000L)
@@ -628,49 +770,46 @@ class GarminPluginTest : TestBaseWithProfile() {
         )
 
         verify(loopHub, atLeastOnce()).glucoseUnit
-        // onSgv also reads the target, the active mode and the TBR minutes left (target/mode/tbrMins fields).
         verify(loopHub, atLeastOnce()).currentTargetMgdl
         verify(loopHub, atLeastOnce()).activeTherapyMode
         verify(loopHub, atLeastOnce()).temporaryBasalRemainingMinutes
+        verify(loopHub, atLeastOnce()).temporaryBasalHistory(any())
+        verify(loopHub, atLeastOnce()).smbHistory(any())
     }
 
+    /** Fields added for the AIMI watchfaces: target, mode, TBR minutes, basal staircase and SMB times. */
     @Test
-    fun onSgv_IncludesTargetModeTbrMins() {
+    fun onSgv_IncludesTargetModeTbrMinsAndHistory() {
         whenever(loopHub.glucoseUnit).thenReturn(GlucoseUnit.MGDL)
         whenever(loopHub.insulinOnboard).thenReturn(1.0)
         whenever(loopHub.insulinBasalOnboard).thenReturn(0.5)
         whenever(loopHub.temporaryBasal).thenReturn(1.2)
         whenever(loopHub.carbsOnboard).thenReturn(5.0)
-        whenever(loopHub.lowGlucoseMark).thenReturn(70.0)
-        whenever(loopHub.highGlucoseMark).thenReturn(180.0)
         whenever(loopHub.currentTargetMgdl).thenReturn(100.0)
         whenever(loopHub.activeTherapyMode).thenReturn("FCL")
         whenever(loopHub.temporaryBasalRemainingMinutes).thenReturn(27)
-        whenever(loopHub.currentProfile).thenReturn(null)
         whenever(loopHub.temporaryBasalHistory(any())).thenReturn(
             listOf(BasalHistoryStep(t = 1000L, p = 100), BasalHistoryStep(t = 2000L, p = 130))
         )
-        whenever(loopHub.smbHistoryTimestamps(any())).thenReturn(listOf(1500L, 2500L))
+        whenever(loopHub.smbHistory(any())).thenReturn(
+            listOf(SmbHistoryStep(t = 1500L, u = 0.35), SmbHistoryStep(t = 2500L, u = 0.20))
+        )
         whenever(loopHub.getGlucoseValues(any(), eq(false))).thenReturn(
             listOf(createGlucoseValue(clock.instant(), 110.0))
         )
-        val json = gp.onSgv(createUri(mapOf("count" to "1", "brief_mode" to "true")))
-        org.junit.jupiter.api.Assertions.assertTrue(
-            json.contains("\"target\":100") &&
-                json.contains("\"mode\":\"FCL\"") &&
-                json.contains("\"tbrMins\":27") &&
-                json.contains("\"basalHistory\":[{\"t\":1000,\"p\":100},{\"t\":2000,\"p\":130}]") &&
-                json.contains("\"smbHistory\":[1500,2500]"),
-            "missing target/mode/tbrMins/basalHistory/smbHistory in: $json"
-        )
+        val json = gp.onSgv(createUri(mapOf("count" to "1", "brief_mode" to "true"))).toString()
+        assertTrue(json.contains("\"target\":100"), json)
+        assertTrue(json.contains("\"mode\":\"FCL\""), json)
+        assertTrue(json.contains("\"tbrMins\":27"), json)
+        assertTrue(json.contains("\"basalHistory\":[{\"t\":1000,\"p\":100},{\"t\":2000,\"p\":130}]"), json)
+        assertTrue(json.contains("\"smbHistory\":[{\"t\":1500,\"u\":0.35},{\"t\":2500,\"u\":0.2}]"), json)
         verify(loopHub).getGlucoseValues(any(), eq(false))
         verify(loopHub, atLeastOnce()).glucoseUnit
-        // onSgv also reads the target, the active mode and the TBR minutes left (target/mode/tbrMins fields).
         verify(loopHub, atLeastOnce()).currentTargetMgdl
         verify(loopHub, atLeastOnce()).activeTherapyMode
         verify(loopHub, atLeastOnce()).temporaryBasalRemainingMinutes
         verify(loopHub, atLeastOnce()).temporaryBasalHistory(any())
-        verify(loopHub, atLeastOnce()).smbHistoryTimestamps(any())
+        verify(loopHub, atLeastOnce()).smbHistory(any())
     }
 
 }
