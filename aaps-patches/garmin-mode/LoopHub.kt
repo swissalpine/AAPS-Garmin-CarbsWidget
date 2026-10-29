@@ -5,7 +5,7 @@ import app.aaps.core.data.model.GlucoseUnit
 import app.aaps.core.interfaces.profile.Profile
 import java.time.Instant
 
-/** One step of temporary basal for the Millimétré staircase (`t` = start in ms, `p` = percent). */
+/** One plateau of temporary basal for Millimétré staircase (`t` = start ms, `p` = percent). */
 data class BasalHistoryStep(val t: Long, val p: Int)
 
 /** One SMB for watch logs (`t` = epoch ms, `u` = insulin units). */
@@ -42,34 +42,34 @@ interface LoopHub {
     val temporaryBasal: Double
 
     /**
-     * Remaining temporary basal duration in whole minutes, or null if no TBR or extended bolus is active.
-     * Used by the Blueprint / Cockpit / Atelier watchfaces (`tbrMins`).
+     * Remaining temporary basal duration in whole minutes, or null if no active TBR / EB.
+     * Used by Blueprint / Cockpit / Atelier watchfaces (`tbrMins`).
      */
     val temporaryBasalRemainingMinutes: Int?
 
     /**
      * Current glucose target in mg/dL for the watch (`target`):
-     * the target of the last APS run when there is one, else the middle of the active temporary
-     * target, else the rounded profile target.
+     * last APS/AIMI `targetBG` (DetermineBasalAIMI2) when available, else active TT midpoint,
+     * else profile rounded target.
      */
     val currentTargetMgdl: Double?
 
     /**
-     * Short label of the active AIMI therapy mode for the watch (`FCL`, `DINNER`, `COFFEE`, ...),
-     * or null when none is active. Read from Careportal NOTE keywords, see [GarminActiveTherapyMode].
+     * Active AIMI therapy mode short label for the watch (`FCL`, `DINNER`, `LUNCH`, …),
+     * or null when none is armed. Detected from Careportal NOTE keywords (same rules as [Therapy]).
      */
     val activeTherapyMode: String?
 
     /**
-     * Temporary basal staircase for Millimétré (`basalHistory`): steps of (start ms, percent) over
-     * [windowMs], one new step only when the percent changes. Percent 100 = profile basal.
-     * ⚠️ ASYNC IMPACT: runBlocking + TBR lookup.
+     * Temporary basal staircase for Millimétré (`basalHistory`): consecutive
+     * (startMs, percent) steps over [windowMs], collapsed when percent is unchanged.
+     * Percent 100 = profile basal. ⚠️ ASYNC IMPACT: runBlocking + DB/TBR lookup.
      */
     fun temporaryBasalHistory(windowMs: Long = 3L * 60L * 60L * 1000L): List<BasalHistoryStep>
 
     /**
-     * SMBs in the last [windowMs] for Millimétré / Téléscripteur (`smbHistory`: `{t,u}`).
-     * ⚠️ ASYNC IMPACT: runBlocking + bolus database query.
+     * SMB boluses in the last [windowMs] for watch faces (`smbHistory`: `{t,u}`).
+     * ⚠️ ASYNC IMPACT: runBlocking + bolus DB query.
      */
     fun smbHistory(windowMs: Long = 3L * 60L * 60L * 1000L): List<SmbHistoryStep>
 
@@ -92,24 +92,27 @@ interface LoopHub {
     /** Notifies the system that carbs were eaten and stores the value. */
     fun postCarbs(carbohydrates: Int)
 
+    // mod Bolus and temp target
     /**
      * Gives a bolus asked for by the watch, limited by the bolus constraints (max bolus) like any
      * other bolus. Returns the amount sent to the pump after that limit, 0.0 when nothing is given.
      * The caller must refuse the request on a client and when no request key is set.
      *
      * The pump command is sent later, so a returned amount means "sent on", not "delivered".
-     * [onNotDelivered] gets the reason when AAPS refuses or fails it after that (for example the loop
-     * is suspended), so the caller can tell the user.
+     * [onNotDelivered] gets the reason when the command queue refuses or fails it after that, so the
+     * caller can tell the user.
      */
     fun postBolus(bolus: Double, onNotDelivered: (String) -> Unit): Double
 
-    /** Stores or cancels a temporary target. A target or duration of zero cancels the current one. */
+    /** Stores or cancels a temptarget. */
     fun postTempTarget(target: Double, duration: Int)
+    // end mod
 
     /**
-     * Activates an AIMI therapy mode via a Careportal NOTE (keyword only, e.g. "lunch", "fcl", "sport").
-     * Duration belongs on the TherapyEvent.duration field. AIMI `Therapy` matches with `note.contains`
-     * and uses `event.duration` for the active window.
+     * Activates an AIMI therapy mode via CarePortal NOTE (keyword only, e.g. "lunch", "fcl", "sport").
+     * Duration belongs on the TherapyEvent.duration field — never embed minutes in the note text
+     * ([Therapy] matches with note.contains and uses event.duration for the active window).
+     * Keywords are detected by openAPSAIMI [Therapy] (`therapy.kt`).
      */
     fun postTherapyMode(keyword: String, durationMin: Int)
 
@@ -120,7 +123,7 @@ interface LoopHub {
         device: String?
     )
 
-    /** Stores step counts that the watch summed over several intervals. */
+    /** Stores steps count readings aggregated over multiple intervals. */
     fun storeStepsCount(
         samplingStart: Instant,
         samplingEnd: Instant,
